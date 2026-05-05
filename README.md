@@ -1,4 +1,4 @@
-# autoscale-resume-intelligence
+# resume-intelligence
 
 Resume / CV → Excel pipeline. Reads a directory of PDF / DOCX / TXT resumes and
 emits a single `.xlsx` workbook with one analysed row per candidate, modelled
