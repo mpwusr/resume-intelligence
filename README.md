@@ -1,131 +1,166 @@
 # autoscale-resume-intelligence
 
-Resume → CSV extraction pipeline. Parses PDF/DOCX/TXT resumes and emits one row per bullet point with employer, role, technologies, and dates.
+Resume / CV → Excel pipeline. Reads a directory of PDF / DOCX / TXT resumes and
+emits a single `.xlsx` workbook with one analysed row per candidate, modelled
+after the `CM_Parser` schema.
 
-## Output Schema
+## Output schema
 
-One row per bullet:
+A single sheet (`Foglio1`) with thirteen columns, one row per candidate:
 
-| Column | Description |
-|---|---|
-| `employee_name` | Candidate name |
-| `employer` | Company name |
-| `role` | Job title |
-| `job_start` | Job start date (`YYYY-MM` or `YYYY`) |
-| `job_end` | Job end date (null = Present) |
-| `bullet_text` | Raw bullet text |
-| `technologies` | Semicolon-joined tech list |
-| `project_start` | Bullet/project start (falls back to `job_start`) |
-| `project_end` | Bullet/project end (falls back to `job_end`) |
-| `source_file` | Original filename |
+| # | Column | Type | Source |
+|---|---|---|---|
+| 1 | Analysis Date | datetime | extraction run timestamp |
+| 2 | CV Link | `=HYPERLINK(...)` formula | local `file://` URI to the source resume |
+| 3 | First Name | text | model |
+| 4 | Last Name | text | model |
+| 5 | Current Role | text | most recent job title |
+| 6 | Current Employer | text | most recent employer |
+| 7 | Prior Employers | comma-joined list | most recent first |
+| 8 | Years Experience | text (`"X+ years"` / `"X years"`) | model |
+| 9 | Cloud Skills | comma-joined or `"N/A"` | constrained to `{AWS, Azure, GCP, OCI, IBM Cloud, Alibaba Cloud}` |
+| 10 | Strategic Summary | English prose, 3–4 sentences | model-generated narrative |
+| 11 | Current Tech | comma-joined list | tools/platforms in current role |
+| 12 | Historical Tech Map | `EMPLOYER: tech, tech; EMPLOYER: tech, tech` | flattened from a `dict[employer → list[str]]` |
+| 13 | System ID | 16-char hex | first 16 chars of SHA-256 of the source file |
 
-## Stack
+## How it works
 
-- Python 3.11+
-- `pdfplumber` (PDFs), `python-docx` (Word), stdlib for `.txt`
-- `anthropic` SDK with tool use for structured output
-- `pydantic` v2 for schema validation
-- `pandas` for CSV output
-- `asyncio` + `anthropic.AsyncAnthropic` for parallelism
+1. **Ingest** — `pdfplumber` for PDFs, `python-docx` for DOCX, `pathlib.read_text`
+   for TXT. Each file becomes a single text blob.
+2. **Extract** — one Claude API call per resume, using
+   [tool use](https://docs.anthropic.com/en/docs/build-with-claude/tool-use)
+   forced via `tool_choice={"type": "tool", "name": "extract_candidate"}`. The
+   tool's `input_schema` is the `Candidate` Pydantic model's
+   `model_json_schema()`, so the model emits a JSON object that exactly matches
+   the schema.
+3. **Validate** — `Candidate.model_validate(tool_use.input)`. On
+   `ValidationError`, the script retries once with the validation error sent
+   back as a `tool_result` correction message.
+4. **Write** — `openpyxl` builds the workbook in memory and saves it. The
+   `CV Link` column is written as a `=HYPERLINK(...)` formula so the cell is
+   clickable in Excel / Numbers / Google Sheets.
 
-## Project Structure
+Model: `claude-sonnet-4-6`, `max_tokens=8192`. Strategic summary is generated
+in English regardless of the resume's source language.
 
-```
-resume_extractor/
-├── main.py              # CLI entrypoint
-├── ingest.py            # file → raw text
-├── models.py            # Pydantic schemas
-├── extract.py           # Claude API + tool-use call
-├── flatten.py           # nested model → CSV rows
-├── prompts/
-│   └── extraction.md    # system prompt
-├── resumes/             # input dir
-└── output/
-    ├── resumes.csv
-    └── manifest.json    # processed-file hashes
-```
-
-## Pydantic Models (`models.py`)
+## Pydantic model
 
 ```python
-from pydantic import BaseModel
-
-class Bullet(BaseModel):
-    text: str
-    technologies: list[str] = []
-    project_start: str | None = None  # "YYYY-MM" or "YYYY"
-    project_end: str | None = None
-
-class Job(BaseModel):
-    employer: str
-    role: str
-    start_date: str | None
-    end_date: str | None  # null = Present
-    bullets: list[Bullet]
-
-class Resume(BaseModel):
-    employee_name: str
-    jobs: list[Job]
+class Candidate(BaseModel):
+    first_name: str
+    last_name: str
+    current_role: str
+    current_employer: str
+    prior_employers: list[str] = []
+    years_experience: str            # "12+ years"
+    cloud_skills: list[str] = []     # subset of CLOUD_VOCAB
+    strategic_summary: str           # 3–4 sentence English narrative
+    current_tech: list[str] = []
+    historical_tech: dict[str, list[str]] = {}
 ```
 
-## Extraction Flow
+## Project layout
 
-1. Register `Resume` as an Anthropic tool via `model_json_schema()`.
-2. Force tool use with `tool_choice={"type": "tool", "name": "extract_resume"}`.
-3. Claude returns a `tool_use` block → validate into `Resume`.
-4. On `ValidationError`, retry once with the error fed back as a correction message.
-
-Model: `claude-sonnet-4-5` is the sweet spot for cost/accuracy. Use Opus for unusually messy resumes.
-
-## Flatten Step
-
-For each resume → job → bullet, emit one row. Fill `project_start` / `project_end` from the bullet if present, else fall back to the parent job's dates. Join `technologies` with `;`.
-
-## Main Loop
-
-1. Scan `resumes/` for new/changed files (SHA-256 vs `manifest.json`).
-2. Ingest in parallel (thread pool — I/O bound).
-3. Extract in parallel (asyncio — API bound, semaphore at ~5 concurrent).
-4. Flatten all rows.
-5. Append to `resumes.csv`, update manifest.
-6. Log per-file status + any validation failures to `output/errors.log`.
-
-## CLI
-
-```bash
-python main.py --input resumes/ --output output/resumes.csv [--force]
 ```
-
-## Edge Cases
-
-- **Scanned PDFs** (no text layer) → detect empty extraction, log for OCR follow-up
-- **"Present" / "Current" / "Now"** → null `end_date`
-- **Date ranges like "2018-2020"** on a bullet → split into start/end
-- **Bullets with no tech mentions** → empty list, not null
-- **Multi-column PDFs** → `pdfplumber` with layout mode or fall back to raw text
-
-## Build Order
-
-| Step | Component | Est. Time |
-|---|---|---|
-| 1 | `models.py` + `prompts/extraction.md` | 45 min |
-| 2 | `ingest.py` (PDF, DOCX, TXT) | 1 hr |
-| 3 | `extract.py` single-file happy path | 1 hr |
-| 4 | `flatten.py` + CSV writer | 30 min |
-| 5 | `main.py` wiring + manifest + async | 1.5 hrs |
-| 6 | Test on 5–10 real resumes, tune prompt | ongoing |
-
-**Total: ~5 hours to a working v1.**
+.
+├── README.md
+├── extract_resumes.py    # ingestion + extraction + workbook writer (single script)
+├── requirements.txt
+├── .env.example          # template — copy to .env and fill in
+├── .gitignore            # excludes resumes/, output/, .env, .venv/
+├── resumes/              # input directory (gitignored, contains PII)
+└── output/               # generated xlsx (gitignored)
+```
 
 ## Setup
 
+Requires Python 3.11+.
+
 ```bash
-python -m venv .venv
+git clone https://github.com/mpwusr/autoscale-resume-intelligence.git
+cd autoscale-resume-intelligence
+
+python3 -m venv .venv
 source .venv/bin/activate
-pip install anthropic pydantic pdfplumber python-docx pandas
-export ANTHROPIC_API_KEY=sk-ant-...
+pip install -r requirements.txt
+
+cp .env.example .env
+# edit .env and paste your real ANTHROPIC_API_KEY
 ```
+
+`.env` is gitignored; verify with `git check-ignore -v .env`.
+
+## Usage
+
+Drop resumes (PDF / DOCX / TXT) into `resumes/`, then:
+
+```bash
+python extract_resumes.py --input resumes/ --output output/CV_Analysis.xlsx
+```
+
+Per-file status is printed to stdout (`[ok]`, `[skip]`, `[fail]`) and the final
+workbook is written to `--output`. Existing output files are overwritten.
+
+### `.doc` (legacy Word format)
+
+`python-docx` does not read the old `.doc` binary format. Convert first:
+
+```bash
+textutil -convert docx resumes/SomeOne.doc   # built into macOS
+rm resumes/SomeOne.doc
+```
+
+### Scanned PDFs
+
+PDFs without a text layer extract to an empty string and are skipped with a
+`[skip] empty extraction` message. OCR is out of scope; pre-process those CVs
+with a tool like `ocrmypdf` if needed.
+
+## Configuration
+
+`.env` keys:
+
+| Key | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` | required — your Anthropic console key |
+
+`load_dotenv(override=True)` is called at import, so values in `.env` always
+win over any pre-existing shell exports. Useful when an old / placeholder key
+is still in your shell environment.
+
+## Cost
+
+Roughly per resume at `claude-sonnet-4-6` rates:
+
+- Input: ~8–15K tokens (a typical resume PDF after text extraction)
+- Output: ~500–1500 tokens (the structured tool call)
+
+Budget ~ \$0.05 per CV. A 100-CV batch is ≈ \$5.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `command not found: python` | macOS provides `python3`, not `python` | use `python3`, or activate the venv (then plain `python` works) |
+| `ModuleNotFoundError: No module named 'pdfplumber'` | the `python3` you ran is not the interpreter `pip` installed into | activate the venv (`source .venv/bin/activate`), or run `python3 -m pip install -r requirements.txt` with the same interpreter |
+| `error: externally-managed-environment` | Homebrew/PEP 668 blocks system-wide pip installs | use a venv (recommended) |
+| `ANTHROPIC_API_KEY is not set` | `.env` not loaded *or* an empty/stale value is set in the shell | the script uses `load_dotenv(override=True)` to defeat shell shadowing — verify `.env` exists in the repo root and contains a non-empty value |
+| `401 invalid x-api-key` | placeholder or wrong key in `.env` | replace with a real key from <https://console.anthropic.com/settings/keys> |
+| `400 Your credit balance is too low` | account out of API credits | top up at <https://console.anthropic.com/settings/billing> |
+
+## Limitations / not-yet-built
+
+- **Synchronous** — one resume at a time. For batches > ~50, add async with an
+  `asyncio.Semaphore`.
+- **No manifest / dedup** — every run re-extracts every file. SHA-256 hashes
+  are written as `System ID` but not consulted as a cache.
+- **No OCR fallback** for scanned PDFs.
+- **`CV Link` points at local `file://` URIs.** If the workbook is shared,
+  swap in Google Drive HYPERLINKs (e.g. via a `--drive-map` CSV).
+- **Strategic summary tone** is loosely specified — the prompt says "no fluff,
+  no first-person", but you should eyeball a few outputs and tighten if needed.
 
 ## License
 
-Proprietary — AutoScaleWorks.ai
+[The Unlicense](LICENSE) — public domain. No rights reserved.
